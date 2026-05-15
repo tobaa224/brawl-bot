@@ -2,13 +2,17 @@ import os
 import json
 import requests
 import discord
+import asyncio
 from datetime import datetime, timezone
+from discord.ext import tasks
 
 API_KEY = os.environ["BRAWLSTARS_API_KEY"]
 TOKEN = os.environ["DISCORD_TOKEN"]
 
 CLUB_TAG = "2QRL2UGPR"
 BASELINE_FILE = "baseline.json"
+
+CHANNEL_ID = 958351466937085965  # 👈 sem dej ID kanálu
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -23,7 +27,7 @@ def get_members():
     return r.json().get("items", [])
 
 
-# --- BASELINE SYSTEM (hour reset like your script) ---
+# --- BASELINE SYSTEM ---
 def load_baseline():
     try:
         with open(BASELINE_FILE, "r") as f:
@@ -43,7 +47,6 @@ def get_leaderboard():
 
     baselines = load_baseline()
 
-    # reset každou hodinu
     if baselines.get("_hour") != current_hour:
         new_base = {"_hour": current_hour}
         for m in members:
@@ -69,10 +72,34 @@ def get_leaderboard():
     return leaderboard
 
 
-# --- DISCORD EVENTS ---
+# --- HOURLY POST ---
+@tasks.loop(hours=1)
+async def hourly_post():
+    await client.wait_until_ready()
+    channel = client.get_channel(CHANNEL_ID)
+
+    if channel:
+        board = get_leaderboard()
+
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+
+        for i, p in enumerate(board):
+            rank = medals[i] if i < 3 else f"#{i+1}"
+            push = f"+{p['pushed']}" if p["pushed"] > 0 else str(p["pushed"])
+
+            lines.append(f"{rank} **{p['name']}** — {push} 🏆 (total {p['trophies']})")
+
+        msg = "🏆 **Hourly Brawl Stars Leaderboard**\n\n" + "\n".join(lines)
+
+        await channel.send(msg)
+
+
+# --- EVENTS ---
 @client.event
 async def on_ready():
     print(f"Bot ready as {client.user}")
+    hourly_post.start()
 
 
 @client.event
