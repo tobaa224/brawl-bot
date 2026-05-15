@@ -1,158 +1,147 @@
 import os
 import json
+import sqlite3
 import requests
 import discord
-from datetime import datetime, timezone
 from discord.ext import tasks
+
+# ======================
+# CONFIG
+# ======================
 
 API_KEY = os.environ["BRAWLSTARS_API_KEY"]
 TOKEN = os.environ["DISCORD_TOKEN"]
 
 CLUB_TAG = "2QRL2UGPR"
-BASELINE_FILE = "baseline.json"
+CHANNEL_ID = 958351466937085
 
-CHANNEL_ID = 958351466937085965  # <-- SEM DEJ ID KANÁLU
+DB_FILE = "brawl.db"
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}"
+}
+
+# ======================
+# DATABASE
+# ======================
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS players (
+        tag TEXT PRIMARY KEY,
+        name TEXT,
+        trophies INTEGER,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS club_state (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        data TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def upsert_player(tag, name, trophies):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute("""
+    INSERT INTO players (tag, name, trophies)
+    VALUES (?, ?, ?)
+    ON CONFLICT(tag) DO UPDATE SET
+        name=excluded.name,
+        trophies=excluded.trophies,
+        last_seen=CURRENT_TIMESTAMP
+    """, (tag, name, trophies))
+
+    conn.commit()
+    conn.close()
+
+
+def save_snapshot(data):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute("""
+    INSERT INTO club_state (data)
+    VALUES (?)
+    """, (json.dumps(data),))
+
+    conn.commit()
+    conn.close()
+
+
+# ======================
+# BRAWL STARS API
+# ======================
+
+def get_club_data():
+    url = f"https://api.brawlstars.com/v1/clubs/%23{CLUB_TAG}"
+
+    r = requests.get(url, headers=HEADERS)
+
+    if r.status_code != 200:
+        print("API ERROR:", r.text)
+        return {"members": []}
+
+    data = r.json()
+
+    members = []
+
+    for m in data.get("members", []):
+        members.append({
+            "tag": m["tag"],
+            "name": m["name"],
+            "trophies": m["trophies"]
+        })
+
+    return {"members": members}
+
+
+# ======================
+# DISCORD BOT
+# ======================
 
 intents = discord.Intents.default()
-intents.message_content = True
-
 client = discord.Client(intents=intents)
 
 
-# --- FETCH CLUB MEMBERS ---
-def get_members():
-    url = f"https://api.brawlstars.com/v1/clubs/%23{CLUB_TAG}/members"
-
-    headers = {
-        "Authorization": f"Bearer {API_KEY}"
-    }
-
-    r = requests.get(url, headers=headers)
-
-    if r.status_code != 200:
-        print("Brawl Stars API Error:", r.text)
-        return []
-
-    return r.json().get("items", [])
-
-
-# --- BASELINE SYSTEM ---
-def load_baseline():
-    try:
-        with open(BASELINE_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {}
-
-
-def save_baseline(data):
-    with open(BASELINE_FILE, "w") as f:
-        json.dump(data, f)
-
-
-def get_leaderboard():
-    members = get_members()
-
-    now = datetime.now(timezone.utc)
-    current_hour = now.strftime("%Y-%m-%dT%H:00")
-
-    baselines = load_baseline()
-
-    # reset baseline každou hodinu
-    if baselines.get("_hour") != current_hour:
-        new_base = {"_hour": current_hour}
-
-        for m in members:
-            new_base[m["tag"]] = m["trophies"]
-
-        save_baseline(new_base)
-        baselines = new_base
-
-    leaderboard = []
-
-    for m in members:
-        tag = m["tag"]
-
-        current = m["trophies"]
-        base = baselines.get(tag, current)
-
-        pushed = current - base
-
-        leaderboard.append({
-            "name": m["name"],
-            "trophies": current,
-            "pushed": pushed
-        })
-
-    leaderboard.sort(key=lambda x: (-x["pushed"], -x["trophies"]))
-
-    return leaderboard
-
-
-# --- FORMAT LEADERBOARD ---
-def build_leaderboard_message():
-    board = get_leaderboard()
-
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-
-    for i, p in enumerate(board):
-        rank = medals[i] if i < 3 else f"#{i+1}"
-
-        push = (
-            f"+{p['pushed']}"
-            if p["pushed"] > 0
-            else str(p["pushed"])
-        )
-
-        lines.append(
-            f"{rank} **{p['name']}** — {push} 🏆 (total {p['trophies']})"
-        )
-
-    return (
-        "🏆 **Brawl Stars Leaderboard (Hourly Push)**\n\n"
-        + "\n".join(lines)
-    )
-
-
-# --- HOURLY POST ---
 @tasks.loop(hours=1)
-async def hourly_post():
-    await client.wait_until_ready()
+async def hourly_update():
+    print("Running hourly update...")
+
+    data = get_club_data()
+
+    for p in data["members"]:
+        upsert_player(p["tag"], p["name"], p["trophies"])
+
+    save_snapshot(data)
 
     channel = client.get_channel(CHANNEL_ID)
-
-    if not channel:
-        print("Channel not found")
-        return
-
-    msg = build_leaderboard_message()
-
-    await channel.send(msg)
-
-    print("Hourly leaderboard sent")
+    if channel:
+        await channel.send("📊 Hourly update hotov!")
 
 
-# --- EVENTS ---
 @client.event
 async def on_ready():
-    print(f"Bot ready as {client.user}")
+    print(f"Logged in as {client.user}")
 
-    # zabrání dvojitému spuštění tasku
-    if not hourly_post.is_running():
-        hourly_post.start()
-
-
-@client.event
-async def on_message(message):
-    if message.author == client.user:
-        return
-
-    if message.content.startswith("!leaderboard"):
-        msg = build_leaderboard_message()
-
-        await message.channel.send(msg)
+    init_db()
+    hourly_update.start()
 
 
-# --- START BOT ---
+# ======================
+# RUN BOT
+# ======================
+
+TOKEN = os.environ["DISCORD_TOKEN"]
 client.run(TOKEN)
