@@ -2,7 +2,6 @@ import os
 import json
 import requests
 import discord
-import asyncio
 from datetime import datetime, timezone
 from discord.ext import tasks
 
@@ -12,18 +11,28 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 CLUB_TAG = "2QRL2UGPR"
 BASELINE_FILE = "baseline.json"
 
-CHANNEL_ID = 958351466937085965  # 👈 sem dej ID kanálu
+CHANNEL_ID = 958351466937085965  # <-- SEM DEJ ID KANÁLU
 
 intents = discord.Intents.default()
 intents.message_content = True
+
 client = discord.Client(intents=intents)
 
 
-# --- FETCH CLUB ---
+# --- FETCH CLUB MEMBERS ---
 def get_members():
     url = f"https://api.brawlstars.com/v1/clubs/%23{CLUB_TAG}/members"
-    headers = {"Authorization": f"Bearer {API_KEY}"}
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}"
+    }
+
     r = requests.get(url, headers=headers)
+
+    if r.status_code != 200:
+        print("Brawl Stars API Error:", r.text)
+        return []
+
     return r.json().get("items", [])
 
 
@@ -35,6 +44,7 @@ def load_baseline():
     except:
         return {}
 
+
 def save_baseline(data):
     with open(BASELINE_FILE, "w") as f:
         json.dump(data, f)
@@ -42,15 +52,19 @@ def save_baseline(data):
 
 def get_leaderboard():
     members = get_members()
+
     now = datetime.now(timezone.utc)
     current_hour = now.strftime("%Y-%m-%dT%H:00")
 
     baselines = load_baseline()
 
+    # reset baseline každou hodinu
     if baselines.get("_hour") != current_hour:
         new_base = {"_hour": current_hour}
+
         for m in members:
             new_base[m["tag"]] = m["trophies"]
+
         save_baseline(new_base)
         baselines = new_base
 
@@ -58,8 +72,10 @@ def get_leaderboard():
 
     for m in members:
         tag = m["tag"]
+
         current = m["trophies"]
         base = baselines.get(tag, current)
+
         pushed = current - base
 
         leaderboard.append({
@@ -69,37 +85,62 @@ def get_leaderboard():
         })
 
     leaderboard.sort(key=lambda x: (-x["pushed"], -x["trophies"]))
+
     return leaderboard
+
+
+# --- FORMAT LEADERBOARD ---
+def build_leaderboard_message():
+    board = get_leaderboard()
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+
+    for i, p in enumerate(board):
+        rank = medals[i] if i < 3 else f"#{i+1}"
+
+        push = (
+            f"+{p['pushed']}"
+            if p["pushed"] > 0
+            else str(p["pushed"])
+        )
+
+        lines.append(
+            f"{rank} **{p['name']}** — {push} 🏆 (total {p['trophies']})"
+        )
+
+    return (
+        "🏆 **Brawl Stars Leaderboard (Hourly Push)**\n\n"
+        + "\n".join(lines)
+    )
 
 
 # --- HOURLY POST ---
 @tasks.loop(hours=1)
 async def hourly_post():
     await client.wait_until_ready()
+
     channel = client.get_channel(CHANNEL_ID)
 
-    if channel:
-        board = get_leaderboard()
+    if not channel:
+        print("Channel not found")
+        return
 
-        medals = ["🥇", "🥈", "🥉"]
-        lines = []
+    msg = build_leaderboard_message()
 
-        for i, p in enumerate(board):
-            rank = medals[i] if i < 3 else f"#{i+1}"
-            push = f"+{p['pushed']}" if p["pushed"] > 0 else str(p["pushed"])
+    await channel.send(msg)
 
-            lines.append(f"{rank} **{p['name']}** — {push} 🏆 (total {p['trophies']})")
-
-        msg = "🏆 **Hourly Brawl Stars Leaderboard**\n\n" + "\n".join(lines)
-
-        await channel.send(msg)
+    print("Hourly leaderboard sent")
 
 
 # --- EVENTS ---
 @client.event
 async def on_ready():
     print(f"Bot ready as {client.user}")
-    hourly_post.start()
+
+    # zabrání dvojitému spuštění tasku
+    if not hourly_post.is_running():
+        hourly_post.start()
 
 
 @client.event
@@ -108,22 +149,10 @@ async def on_message(message):
         return
 
     if message.content.startswith("!leaderboard"):
-        board = get_leaderboard()
-
-        medals = ["🥇", "🥈", "🥉"]
-        lines = []
-
-        for i, p in enumerate(board):
-            rank = medals[i] if i < 3 else f"#{i+1}"
-            push = f"+{p['pushed']}" if p["pushed"] > 0 else str(p["pushed"])
-
-            lines.append(
-                f"{rank} **{p['name']}** — {push} 🏆 (total {p['trophies']})"
-            )
-
-        msg = "🏆 **Brawl Stars Leaderboard (Hourly Push)**\n\n" + "\n".join(lines)
+        msg = build_leaderboard_message()
 
         await message.channel.send(msg)
 
 
+# --- START BOT ---
 client.run(TOKEN)
